@@ -1,7 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
-const SAMPLE_RATE = 16000
-const BUFFER_SIZE = 4096
+import { encodeWav, resample, TARGET_SAMPLE_RATE } from "@/lib/wav"
+
+/** Inline worklet: taps mono input, posts Float32 copies to main thread (no deprecated ScriptProcessor). */
+const CAPTURE_WORKLET_SOURCE = `
+class SwadesCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || input.length === 0) return true;
+    const ch0 = input[0];
+    if (!ch0 || ch0.length === 0) return true;
+    const copy = new Float32Array(ch0.length);
+    copy.set(ch0);
+    this.port.postMessage(copy.buffer, [copy.buffer]);
+    return true;
+  }
+}
+registerProcessor("swades-capture", SwadesCaptureProcessor);
+`
 
 export interface WavChunk {
   id: string
@@ -9,6 +25,7 @@ export interface WavChunk {
   url: string
   duration: number
   timestamp: number
+  sequenceIndex: number
 }
 
 export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
@@ -16,57 +33,13 @@ export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
 interface UseRecorderOptions {
   chunkDuration?: number
   deviceId?: string
-}
-
-function encodeWav(samples: Float32Array, sampleRate: number): Blob {
-  const buffer = new ArrayBuffer(44 + samples.length * 2)
-  const view = new DataView(buffer)
-
-  const writeStr = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i))
-    }
-  }
-
-  writeStr(0, "RIFF")
-  view.setUint32(4, 36 + samples.length * 2, true)
-  writeStr(8, "WAVE")
-  writeStr(12, "fmt ")
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true)
-  view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * 2, true)
-  view.setUint16(32, 2, true)
-  view.setUint16(34, 16, true)
-  writeStr(36, "data")
-  view.setUint32(40, samples.length * 2, true)
-
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]))
-    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true)
-  }
-
-  return new Blob([buffer], { type: "audio/wav" })
-}
-
-function resample(input: Float32Array, fromRate: number, toRate: number): Float32Array {
-  if (fromRate === toRate) return input
-  const ratio = fromRate / toRate
-  const length = Math.round(input.length / ratio)
-  const output = new Float32Array(length)
-  for (let i = 0; i < length; i++) {
-    const srcIndex = i * ratio
-    const low = Math.floor(srcIndex)
-    const high = Math.min(low + 1, input.length - 1)
-    const frac = srcIndex - low
-    output[i] = input[low] * (1 - frac) + input[high] * frac
-  }
-  return output
+  onChunk?: (chunk: WavChunk) => void
 }
 
 export function useRecorder(options: UseRecorderOptions = {}) {
-  const { chunkDuration = 5, deviceId } = options
+  const { chunkDuration = 2, deviceId, onChunk } = options
+  const onChunkRef = useRef(onChunk)
+  onChunkRef.current = onChunk
 
   const [status, setStatus] = useState<RecorderStatus>("idle")
   const [chunks, setChunks] = useState<WavChunk[]>([])
@@ -75,16 +48,35 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
   const streamRef = useRef<MediaStream | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
-  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const workletRef = useRef<AudioWorkletNode | null>(null)
+  const muteRef = useRef<GainNode | null>(null)
+  const nativeRateRef = useRef(48000)
   const samplesRef = useRef<Float32Array[]>([])
   const sampleCountRef = useRef(0)
-  const chunkThreshold = SAMPLE_RATE * chunkDuration
+  const chunkThreshold = TARGET_SAMPLE_RATE * chunkDuration
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const startTimeRef = useRef(0)
   const pausedElapsedRef = useRef(0)
   const statusRef = useRef<RecorderStatus>("idle")
+  const chunkSeqRef = useRef(0)
 
   statusRef.current = status
+
+  const commitSamplesAsChunk = useCallback((merged: Float32Array) => {
+    const blob = encodeWav(merged, TARGET_SAMPLE_RATE)
+    const url = URL.createObjectURL(blob)
+    const sequenceIndex = chunkSeqRef.current++
+    const chunk: WavChunk = {
+      id: crypto.randomUUID(),
+      blob,
+      url,
+      duration: merged.length / TARGET_SAMPLE_RATE,
+      timestamp: Date.now(),
+      sequenceIndex,
+    }
+    setChunks((prev) => [...prev, chunk])
+    onChunkRef.current?.(chunk)
+  }, [])
 
   const flushChunk = useCallback(() => {
     if (samplesRef.current.length === 0) return
@@ -99,17 +91,8 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     samplesRef.current = []
     sampleCountRef.current = 0
 
-    const blob = encodeWav(merged, SAMPLE_RATE)
-    const url = URL.createObjectURL(blob)
-    const chunk: WavChunk = {
-      id: crypto.randomUUID(),
-      blob,
-      url,
-      duration: merged.length / SAMPLE_RATE,
-      timestamp: Date.now(),
-    }
-    setChunks((prev) => [...prev, chunk])
-  }, [])
+    commitSamplesAsChunk(merged)
+  }, [commitSamplesAsChunk])
 
   const start = useCallback(async () => {
     if (statusRef.current === "recording") return
@@ -123,21 +106,31 @@ export function useRecorder(options: UseRecorderOptions = {}) {
       })
 
       const audioCtx = new AudioContext()
-      const source = audioCtx.createMediaStreamSource(mediaStream)
-      const processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1)
-      const nativeSampleRate = audioCtx.sampleRate
+      const nativeRate = audioCtx.sampleRate
+      nativeRateRef.current = nativeRate
 
-      processor.onaudioprocess = (e) => {
+      const blob = new Blob([CAPTURE_WORKLET_SOURCE], { type: "application/javascript" })
+      const workletUrl = URL.createObjectURL(blob)
+      try {
+        await audioCtx.audioWorklet.addModule(workletUrl)
+      } finally {
+        URL.revokeObjectURL(workletUrl)
+      }
+
+      const workletNode = new AudioWorkletNode(audioCtx, "swades-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+      })
+
+      workletNode.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
         if (statusRef.current !== "recording") return
-
-        const input = e.inputBuffer.getChannelData(0)
-        const resampled = resample(new Float32Array(input), nativeSampleRate, SAMPLE_RATE)
+        const input = new Float32Array(ev.data)
+        const resampled = resample(input, nativeRateRef.current, TARGET_SAMPLE_RATE)
 
         samplesRef.current.push(resampled)
         sampleCountRef.current += resampled.length
 
         if (sampleCountRef.current >= chunkThreshold) {
-          // flush synchronously from the collected buffers
           const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
           const merged = new Float32Array(totalLen)
           let off = 0
@@ -148,29 +141,26 @@ export function useRecorder(options: UseRecorderOptions = {}) {
           samplesRef.current = []
           sampleCountRef.current = 0
 
-          const blob = encodeWav(merged, SAMPLE_RATE)
-          const url = URL.createObjectURL(blob)
-          const chunk: WavChunk = {
-            id: crypto.randomUUID(),
-            blob,
-            url,
-            duration: merged.length / SAMPLE_RATE,
-            timestamp: Date.now(),
-          }
-          setChunks((prev) => [...prev, chunk])
+          commitSamplesAsChunk(merged)
         }
       }
 
-      source.connect(processor)
-      processor.connect(audioCtx.destination)
+      const source = audioCtx.createMediaStreamSource(mediaStream)
+      const mute = audioCtx.createGain()
+      mute.gain.value = 0
+      source.connect(workletNode)
+      source.connect(mute)
+      mute.connect(audioCtx.destination)
 
       streamRef.current = mediaStream
       audioCtxRef.current = audioCtx
-      processorRef.current = processor
+      workletRef.current = workletNode
+      muteRef.current = mute
       setStream(mediaStream)
 
       samplesRef.current = []
       sampleCountRef.current = 0
+      chunkSeqRef.current = 0
       pausedElapsedRef.current = 0
       startTimeRef.current = Date.now()
       setElapsed(0)
@@ -186,19 +176,24 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     } catch {
       setStatus("idle")
     }
-  }, [deviceId, chunkThreshold])
+  }, [deviceId, chunkThreshold, commitSamplesAsChunk])
 
   const stop = useCallback(() => {
     flushChunk()
 
-    processorRef.current?.disconnect()
+    if (workletRef.current) {
+      workletRef.current.port.onmessage = null
+      workletRef.current.disconnect()
+    }
+    muteRef.current?.disconnect()
     streamRef.current?.getTracks().forEach((t) => t.stop())
     if (audioCtxRef.current?.state !== "closed") {
       audioCtxRef.current?.close()
     }
     if (timerRef.current) clearInterval(timerRef.current)
 
-    processorRef.current = null
+    workletRef.current = null
+    muteRef.current = null
     audioCtxRef.current = null
     streamRef.current = null
     setStream(null)
@@ -220,12 +215,16 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   const clearChunks = useCallback(() => {
     for (const c of chunks) URL.revokeObjectURL(c.url)
     setChunks([])
+    chunkSeqRef.current = 0
   }, [chunks])
 
-  // cleanup on unmount
   useEffect(() => {
     return () => {
-      processorRef.current?.disconnect()
+      if (workletRef.current) {
+        workletRef.current.port.onmessage = null
+        workletRef.current.disconnect()
+      }
+      muteRef.current?.disconnect()
       streamRef.current?.getTracks().forEach((t) => t.stop())
       if (audioCtxRef.current?.state !== "closed") {
         audioCtxRef.current?.close()

@@ -2,6 +2,7 @@
 dist/
 /build
 /out/
+storage/
 
 # dev
 .yarn/

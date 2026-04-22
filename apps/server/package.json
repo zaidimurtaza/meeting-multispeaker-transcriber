@@ -6,10 +6,13 @@
     "build": "tsdown",
     "check-types": "tsc -b",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
-    "dev": "bun run --hot src/index.ts",
-    "start": "bun run dist/index.mjs"
+    "dev": "tsx watch src/index.ts",
+    "dev:bun": "bun run --hot src/index.ts",
+    "start": "node dist/index.mjs",
+    "start:bun": "bun run dist/index.mjs"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.7",
     "@my-better-t-app/db": "*",
     "@my-better-t-app/env": "*",
     "dotenv": "^17.2.2",
@@ -20,6 +23,7 @@
     "@my-better-t-app/config": "*",
     "@types/bun": "^1.3.4",
     "tsdown": "^0.16.5",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }
