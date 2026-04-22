@@ -2,6 +2,9 @@
 
 Live: https://meeting-multispeaker-transcriber-we.vercel.app/
 
+<img width="1662" height="867" alt="image" src="https://github.com/user-attachments/assets/856df5d1-b0ef-4b5b-9b96-af68290509d2" />
+
+
 An assignment for building a reliable chunking setup that ensures recording data stays accurate in all cases — no data loss, no silent failures.
 
 ## How It Works
