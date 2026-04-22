@@ -1,5 +1,7 @@
 # Reliable Recording Chunking Pipeline
 
+Live: https://meeting-multispeaker-transcriber-we.vercel.app/
+
 An assignment for building a reliable chunking setup that ensures recording data stays accurate in all cases — no data loss, no silent failures.
 
 ## How It Works
